@@ -1496,6 +1496,19 @@ void RandomPlayerbotMgr::CheckPlayerZonePopulation()
 
         uint32 zoneId = player->GetZoneId();
 
+        // The classic low- and mid-level leveling zones (AiPlayerbot.ZoneBracket defaults - starter
+        // zones through the first leveling hubs on each continent) are always treated as safe, on top
+        // of capitals/sanctuaries below. New/leveling characters live there and enemy-faction world PvP
+        // recruitment would just be griefing, regardless of what real players happen to be standing in
+        // them right now.
+        static std::unordered_set<uint32> const lowAndMidLevelZones =
+        {
+            // Low-level zones (Default Min,Max: 5,12)
+            1, 12, 14, 85, 141, 215, 3430, 3524,
+            // Mid-level zones (Default Min,Max roughly 10-25)
+            17, 38, 40, 130, 148, 3433, 3525
+        };
+
         // No world PvP population in capitals or other sanctuaries - it makes no sense there, and PvP
         // is off in a sanctuary anyway. sTravelMgr.IsCapitalZone() is the same curated capital list the
         // city-banker teleport feature uses (more precise than the DBC capital flag - it also covers
@@ -1503,7 +1516,7 @@ void RandomPlayerbotMgr::CheckPlayerZonePopulation()
         AreaTableEntry const* zoneEntry = sAreaTableStore.LookupEntry(zoneId);
         AreaTableEntry const* areaEntry = sAreaTableStore.LookupEntry(player->GetAreaId());
         bool inSafeZone = sTravelMgr.IsCapitalZone(zoneId) || (zoneEntry && zoneEntry->IsSanctuary()) ||
-                          (areaEntry && areaEntry->IsSanctuary());
+                          (areaEntry && areaEntry->IsSanctuary()) || lowAndMidLevelZones.count(zoneId);
         if (inSafeZone)
             continue;
 
@@ -1532,10 +1545,13 @@ void RandomPlayerbotMgr::CheckPlayerZonePopulation()
         // level range, treat the zone as legitimately played rather than overleveled, even if another
         // visitor has outgrown it.
         uint32 zoneMinLevel = 0, zoneMaxLevel = 0;
+        uint32 avgPlayerLevel = static_cast<uint32>(std::lround(
+            std::accumulate(playersInZone.begin(), playersInZone.end(), 0.0, 
+            [](double sum, Player* p) { return sum + p->GetLevel(); })
+            / playersInZone.size()));
+
         bool hasZoneBracket = sTravelMgr.GetZoneLevelBracket(zoneId, zoneMinLevel, zoneMaxLevel);
-        bool overleveledForZone =
-            hasZoneBracket && std::all_of(playersInZone.begin(), playersInZone.end(),
-                                           [zoneMaxLevel](Player* p) { return p->GetLevel() + 5 > zoneMaxLevel; });
+        bool overleveledForZone = hasZoneBracket && (avgPlayerLevel > zoneMaxLevel + 5);
 
         uint32 allianceRatio = sPlayerbotAIConfig.randomBotAllianceRatio;
         uint32 hordeRatio = sPlayerbotAIConfig.randomBotHordeRatio;
@@ -1554,6 +1570,12 @@ void RandomPlayerbotMgr::CheckPlayerZonePopulation()
             allianceTarget++;
         uint32 hordeTarget = zoneTarget - allianceTarget;
 
+        if(overleveledForZone
+            && !roll_chance_f(sPlayerbotAIConfig.syncBotsWithPlayerOverleveledEnemyChance))
+        {
+            continue;
+        }
+
         for (TeamId team : { TEAM_ALLIANCE, TEAM_HORDE })
         {
             if (!globalMoveBudget)
@@ -1562,12 +1584,6 @@ void RandomPlayerbotMgr::CheckPlayerZonePopulation()
             uint32 target = (team == TEAM_ALLIANCE) ? allianceTarget : hordeTarget;
             if (!target)
                 continue;
-
-            if(overleveledForZone 
-                && !roll_chance_f(sPlayerbotAIConfig.syncBotsWithPlayerOverleveledEnemyChance))
-            {
-                continue;
-            }
 
             // The target is a cap on already-recruited worldPvpBots for this zone, not on ambient
             // random-bot traffic passing through - a big leveling zone like Stranglethorn Vale always
