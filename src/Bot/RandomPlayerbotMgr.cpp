@@ -12,7 +12,10 @@
 #include <cstdlib>
 #include <ctime>
 #include <iomanip>
+#include <limits>
+#include <numeric>
 #include <random>
+#include <unordered_set>
 
 #include "AiFactory.h"
 #include "Battleground.h"
@@ -375,6 +378,12 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 /*elapsed*/, bool /*minimal*/)
     {
         if (time(nullptr) > (PlayersCheckTimer + 60))
             sRandomPlayerbotMgr.CheckPlayers();
+    }
+
+    if (sPlayerbotAIConfig.syncBotsWithPlayer && !players.empty())
+    {
+        if (time(nullptr) > (SyncBotsCheckTimer + sPlayerbotAIConfig.syncBotsWithPlayerInterval))
+            sRandomPlayerbotMgr.CheckPlayerZonePopulation();
     }
 
     if (sPlayerbotAIConfig.randomBotJoinBG /* && !players.empty()*/)
@@ -1313,6 +1322,476 @@ void RandomPlayerbotMgr::CheckPlayers()
     LOG_INFO("playerbots", "Max player level is {}, max bot level set to {}", playersLevel - 3, playersLevel);
 }
 
+std::vector<WorldLocation> RandomPlayerbotMgr::GetLocationsAroundPlayer(Player* player, uint32 count, float minDist,
+                                                                        float maxDist)
+{
+    std::vector<WorldLocation> locs;
+
+    Map* map = player->GetMap();
+    if (!map)
+        return locs;
+
+    // A plain radial offset can land outside the player's zone near a border - bound the retries so a
+    // candidate is only kept if it's genuinely still "somewhere in" the player's own zone. Use a
+    // generous retry budget so a player near a zone border still usually yields enough in-zone points.
+    uint32 zoneId = player->GetZoneId();
+    uint32 attempts = count * 10;
+    for (uint32 i = 0; i < attempts && locs.size() < count; i++)
+    {
+        float angle = frand(0.0f, 2 * static_cast<float>(M_PI));
+        float dist = frand(minDist, maxDist);
+        float x = player->GetPositionX() + cos(angle) * dist;
+        float y = player->GetPositionY() + sin(angle) * dist;
+        float z = player->GetPositionZ();
+
+        if (map->GetZoneId(player->GetPhaseMask(), x, y, z) != zoneId)
+            continue;
+
+        locs.emplace_back(player->GetMapId(), x, y, z, 0.0f);
+    }
+
+    // Guaranteed non-empty fallback: near a zone border (or in a very small zone) every candidate can
+    // land in a neighboring zone and get rejected, leaving locs empty and silently dropping the recruit.
+    // A tight ring at minDist is far more likely to stay inside the zone; deliberately skip the zone
+    // filter here since this is a last resort. RandomTeleport still validates ground/water/team on
+    // whatever it's handed, so an occasional cross-border point is harmless.
+    if (locs.empty())
+    {
+        for (uint32 i = 0; i < count; i++)
+        {
+            float angle = frand(0.0f, 2 * static_cast<float>(M_PI));
+            float x = player->GetPositionX() + cos(angle) * minDist;
+            float y = player->GetPositionY() + sin(angle) * minDist;
+            float z = player->GetPositionZ();
+            locs.emplace_back(player->GetMapId(), x, y, z, 0.0f);
+        }
+
+        // Absolute last resort: the player's own position, so the caller always has something to try.
+        locs.emplace_back(player->GetMapId(), player->GetPositionX(), player->GetPositionY(),
+                          player->GetPositionZ(), 0.0f);
+    }
+
+    return locs;
+}
+
+void RandomPlayerbotMgr::MaintainWorldPvpBots()
+{
+    for (auto it = worldPvpBots.begin(); it != worldPvpBots.end();)
+    {
+        WorldPvpBotEntry& entry = it->second;
+        Player* bot = GetPlayerBot(ObjectGuid::Create<HighGuid::Player>(it->first));
+
+        // Unmark helper: erase the tracking entry and advance the iterator.
+        auto unmark = [&]() { it = worldPvpBots.erase(it); };
+
+        // (a)+(c): Is there still a real player in this zone who is NOT sitting in a
+        // safe zone (capital / sanctuary / protected sub-area)? If the whole zone is
+        // a capital/sanctuary, or every real player in it is inside a sanctuary area,
+        // there is no valid PvP target and the mark is meaningless -> unmark now.
+        // NOTE: no level-variance filter here (spec (a)/(c) are zone/safe-zone only);
+        // level variance only governs the reach refresh below.
+        AreaTableEntry const* zoneEntry = sAreaTableStore.LookupEntry(entry.zoneId);
+        bool zoneWideSafe = sTravelMgr.IsCapitalZone(entry.zoneId) ||
+                            (zoneEntry && zoneEntry->IsSanctuary());
+
+        bool zoneHasValidPlayer = false;
+        if (!zoneWideSafe)
+        {
+            for (Player* player : players)
+            {
+                if (!player->IsInWorld() || player->GetZoneId() != entry.zoneId)
+                    continue;
+
+                AreaTableEntry const* areaEntry = sAreaTableStore.LookupEntry(player->GetAreaId());
+                if (areaEntry && areaEntry->IsSanctuary())
+                    continue; // player is in a protected sub-area -> not a valid target
+
+                zoneHasValidPlayer = true;
+                break;
+            }
+        }
+
+        if (!zoneHasValidPlayer)
+        {
+            if (sPlayerbotAIConfig.worldPvpDebug)
+                LOG_INFO("playerbots", "[WorldPvpDebug] unmarked bot guid {} zone {} - reason: no valid player in zone",
+                         it->first, entry.zoneId);
+            unmark();          // covers (a) empty zone and (c) all-players-in-safe-zone
+            continue;
+        }
+
+        // (b) Positioning - ONLY for a live, in-world bot that is still in its assigned zone. A
+        // dead/ghost bot has nothing to position, a not-currently-loaded bot has no position, and a
+        // bot that has wandered/been-teleported/dragged-into-combat out of the zone is no longer
+        // comparable against same-zone players via raw GetDistance() (it can return a huge,
+        // meaningless cross-map value) - all of these are simply left alone until they resolve
+        // themselves (or the zone stops having a valid player, handled above).
+        if (bot && bot->IsInWorld() && bot->IsAlive() && bot->GetZoneId() == entry.zoneId)
+        {
+            // Track the nearest matching player as the positioning target.
+            Player* matched = nullptr;
+            for (Player* player : players)
+            {
+                if (!player->IsInWorld() || player->GetZoneId() != entry.zoneId)
+                    continue;
+
+                if (std::abs(static_cast<int32>(player->GetLevel()) - static_cast<int32>(entry.centerLevel)) >
+                    static_cast<int32>(sPlayerbotAIConfig.syncBotsWithPlayerLevelVariance))
+                    continue;
+
+                if (!matched || bot->GetDistance(player) < bot->GetDistance(matched))
+                    matched = player;
+            }
+
+            // A bot that has drifted beyond the [Min,Max] band re-teleports into it, provided it's
+            // not busy fighting. No walking/pursuit, no reach timer - just periodic re-anchoring for
+            // as long as a valid player remains in the zone.
+            if (matched && !bot->IsInCombat() &&
+                bot->GetDistance(matched) > sPlayerbotAIConfig.syncBotsWithPlayerMaxDistance)
+                TeleportWorldPvpBotNearTarget(bot, matched);
+        }
+
+        ++it;
+    }
+}
+
+void RandomPlayerbotMgr::CheckPlayerZonePopulation()
+{
+    SyncBotsCheckTimer = time(nullptr);
+
+    LOG_DEBUG("playerbots", "Checking player zone population...");
+
+    MaintainWorldPvpBots();
+
+    std::unordered_set<uint32> claimedThisTick;
+
+    // Bound total work done by this pass to the same order of magnitude as the rest of the random-bot
+    // system's per-tick throttle, so a busy server with many online players can't trigger an unbounded
+    // burst of full respecs/DB saves independent of AiPlayerbot.RandomBotsPerInterval.
+    uint32 globalMoveBudget = sPlayerbotAIConfig.randomBotsPerInterval;
+    uint32 maxLevel = sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL);
+
+    // Group eligible real players by zone first, so AiPlayerbot.SyncBotsWithPlayerZoneTargetCount is a
+    // budget for the ZONE, not a per-player allowance - two real players sharing a zone must still only
+    // pull in one target-count's worth of bots between them, while players in different zones each get
+    // their own independent target.
+    std::unordered_map<uint32, std::vector<Player*>> zonePlayers;
+
+    for (Player* player : players)
+    {
+        // Deliberately do NOT skip on IsGameMaster(): that reflects the runtime ".gm on" admin-mode
+        // toggle (PLAYER_EXTRA_GM_ON), not account security level - a solo server owner playing on a
+        // GM-security account (with GM login-state off, the default) already has IsGameMaster()==false,
+        // and even one who runs ".gm on" for convenience (fly/invuln) is still physically present and
+        // should still get world population around them. Only exclude a GM who is actually invisible or
+        // spectating, since populating bots around someone who isn't really "there" is pointless.
+        if (!player->IsInWorld() || !player->isGMVisible() || player->IsGMSpectator())
+            continue;
+
+        // Only open-world continents make sense here (matches the allowed-map filter already applied
+        // inside RandomTeleport).
+        if (std::find(sPlayerbotAIConfig.randomBotMaps.begin(), sPlayerbotAIConfig.randomBotMaps.end(),
+                      player->GetMapId()) == sPlayerbotAIConfig.randomBotMaps.end())
+            continue;
+
+        uint32 zoneId = player->GetZoneId();
+
+        // No world PvP population in capitals or other sanctuaries - it makes no sense there, and PvP
+        // is off in a sanctuary anyway. sTravelMgr.IsCapitalZone() is the same curated capital list the
+        // city-banker teleport feature uses (more precise than the DBC capital flag - it also covers
+        // the neutral hubs Shattrath/Dalaran).
+        AreaTableEntry const* zoneEntry = sAreaTableStore.LookupEntry(zoneId);
+        AreaTableEntry const* areaEntry = sAreaTableStore.LookupEntry(player->GetAreaId());
+        bool inSafeZone = sTravelMgr.IsCapitalZone(zoneId) || (zoneEntry && zoneEntry->IsSanctuary()) ||
+                          (areaEntry && areaEntry->IsSanctuary());
+        if (inSafeZone)
+            continue;
+
+        zonePlayers[zoneId].push_back(player);
+    }
+
+    for (auto& [zoneId, playersInZone] : zonePlayers)
+    {
+        if (!globalMoveBudget)
+            break;
+
+        uint32 variance = sPlayerbotAIConfig.syncBotsWithPlayerLevelVariance;
+
+        // World PvP bots level off the zone's real-player population as a whole, not off whichever
+        // single player they get anchored/positioned to - two real players sharing a zone at very
+        // different levels should pull recruits toward the middle, not toward one or the other.
+        uint32 avgZoneLevel = static_cast<uint32>(std::lround(
+            std::accumulate(playersInZone.begin(), playersInZone.end(), 0.0,
+                             [](double sum, Player* p) { return sum + p->GetLevel(); }) /
+            playersInZone.size()));
+
+        // A player above the zone's own intended level range (its AiPlayerbot.ZoneBracket, or the
+        // built-in default) is "overleveled" for it - e.g. a level 60 camping Westfall. Enemy-faction
+        // recruitment there should be a rare event, not the norm; same-faction population is untouched
+        // since it carries no PvP risk. If at least one player sharing the zone is still within its
+        // level range, treat the zone as legitimately played rather than overleveled, even if another
+        // visitor has outgrown it.
+        uint32 zoneMinLevel = 0, zoneMaxLevel = 0;
+        bool hasZoneBracket = sTravelMgr.GetZoneLevelBracket(zoneId, zoneMinLevel, zoneMaxLevel);
+        bool overleveledForZone =
+            hasZoneBracket && std::all_of(playersInZone.begin(), playersInZone.end(),
+                                           [zoneMaxLevel](Player* p) { return p->GetLevel() + 5 > zoneMaxLevel; });
+
+        uint32 allianceRatio = sPlayerbotAIConfig.randomBotAllianceRatio;
+        uint32 hordeRatio = sPlayerbotAIConfig.randomBotHordeRatio;
+        uint32 totalRatio = allianceRatio + hordeRatio;
+        if (!totalRatio)
+            continue;
+
+        // Split the zone target across factions the same way AddRandomBots() splits the global bot
+        // count: give the remainder to one faction at random instead of letting integer division
+        // silently undershoot the configured target every single time. Computed once per zone (not
+        // per player), so the target is a shared budget for everyone in it.
+        uint32 zoneTarget = sPlayerbotAIConfig.syncBotsWithPlayerZoneTargetCount;
+        uint32 allianceTarget = zoneTarget * allianceRatio / totalRatio;
+        uint32 remainder = zoneTarget * allianceRatio % totalRatio;
+        if (remainder && urand(1, totalRatio) <= remainder)
+            allianceTarget++;
+        uint32 hordeTarget = zoneTarget - allianceTarget;
+
+        for (TeamId team : { TEAM_ALLIANCE, TEAM_HORDE })
+        {
+            if (!globalMoveBudget)
+                break;
+
+            uint32 target = (team == TEAM_ALLIANCE) ? allianceTarget : hordeTarget;
+            if (!target)
+                continue;
+
+            if(overleveledForZone 
+                && !roll_chance_f(sPlayerbotAIConfig.syncBotsWithPlayerOverleveledEnemyChance))
+            {
+                continue;
+            }
+
+            // The target is a cap on already-recruited worldPvpBots for this zone, not on ambient
+            // random-bot traffic passing through - a big leveling zone like Stranglethorn Vale always
+            // has same-level bots wandering somewhere in it regardless of world PvP, and counting those
+            // toward the target let it look "satisfied" while nothing was actually near the player.
+            uint32 satisfied = 0;
+            for (auto const& [guid, entry] : worldPvpBots)
+            {
+                if (entry.zoneId != zoneId)
+                    continue;
+
+                Player* bot = GetPlayerBot(ObjectGuid::Create<HighGuid::Player>(guid));
+                if (bot && bot->GetTeamId() == team)
+                    satisfied++;
+            }
+
+            // Bots already standing in the zone are preferred over ones pulled in from elsewhere on the
+            // continent - they still get teleported to the player's side (and re-leveled) per config
+            // like any other recruit, but there's no reason to yank in a distant bot when an unmarked
+            // one is already right there.
+            std::vector<uint32> eligibleInZone;
+            std::vector<uint32> eligibleElsewhere;
+
+            for (uint32 guid : currentBots)
+            {
+                if (claimedThisTick.count(guid))
+                    continue;
+
+                Player* bot = GetPlayerBot(ObjectGuid::Create<HighGuid::Player>(guid));
+                if (!bot || !bot->IsInWorld() || !IsRandomBot(bot) || bot->GetTeamId() != team)
+                    continue;
+
+                // A bot already marked for world PvP elsewhere isn't up for grabs - it shouldn't be
+                // poached into a different player's zone before it gets its chance to engage.
+                if (worldPvpBots.count(guid))
+                    continue;
+
+                // Only pull in bots that are actually free to move (dead bots need Revive()'s
+                // resurrect-then-teleport handling, not a raw relevel/teleport).
+                if (!bot->IsAlive() || bot->GetGroup() || bot->IsInCombat() || bot->InBattleground() ||
+                    bot->InBattlegroundQueue() || bot->InArena() || bot->IsBeingTeleported())
+                    continue;
+
+                // Death Knights can never go below CONFIG_START_HEROIC_PLAYER_LEVEL (55 by default) -
+                // skip one only if it can't reach that floor for any player sharing this zone.
+                if (bot->getClass() == CLASS_DEATH_KNIGHT &&
+                    std::none_of(playersInZone.begin(), playersInZone.end(), [variance](Player* p) {
+                        return static_cast<int32>(p->GetLevel()) + static_cast<int32>(variance) >=
+                               static_cast<int32>(sWorld->getIntConfig(CONFIG_START_HEROIC_PLAYER_LEVEL));
+                    }))
+                    continue;
+
+                if (bot->GetZoneId() == zoneId)
+                    eligibleInZone.push_back(guid);
+                else
+                    eligibleElsewhere.push_back(guid);
+            }
+
+            if (satisfied >= target || (eligibleInZone.empty() && eligibleElsewhere.empty()))
+                continue;
+
+            uint32 need = std::min({ target - satisfied, sPlayerbotAIConfig.syncBotsWithPlayerMaxPerInterval,
+                                     static_cast<uint32>(eligibleInZone.size() + eligibleElsewhere.size()),
+                                     globalMoveBudget });
+
+            // Order the in-zone candidates nearest-anchor-first so the bots physically closest to a real
+            // player are reused before farther ones (and, via the in-zone-first concatenation below, before
+            // any distant out-of-zone bot). Distances are precomputed once here rather than recomputed on
+            // every comparison inside a sort comparator.
+            std::vector<std::pair<float, uint32>> inZoneByDistance;
+            inZoneByDistance.reserve(eligibleInZone.size());
+            for (uint32 guid : eligibleInZone)
+            {
+                Player* bot = GetPlayerBot(ObjectGuid::Create<HighGuid::Player>(guid));
+                float best = std::numeric_limits<float>::max();
+                if (bot)
+                    for (Player* p : playersInZone)
+                        best = std::min(best, bot->GetDistance(p));
+                inZoneByDistance.emplace_back(best, guid);
+            }
+            std::sort(inZoneByDistance.begin(), inZoneByDistance.end(),
+                      [](std::pair<float, uint32> const& a, std::pair<float, uint32> const& b)
+                      { return a.first < b.first; });
+
+            eligibleInZone.clear();
+            for (auto const& entry : inZoneByDistance)
+                eligibleInZone.push_back(entry.second);
+
+            // Out-of-zone bots have no meaningful distance to the zone yet (they'll be teleported
+            // regardless), so a plain shuffle keeps the pick from always drawing the same ones.
+            std::shuffle(eligibleElsewhere.begin(), eligibleElsewhere.end(), RandomEngine::Instance());
+
+            std::vector<uint32> eligible = std::move(eligibleInZone);
+            eligible.insert(eligible.end(), eligibleElsewhere.begin(), eligibleElsewhere.end());
+
+            for (uint32 i = 0; i < need; i++)
+            {
+                uint32 guid = eligible[i];
+                Player* bot = GetPlayerBot(ObjectGuid::Create<HighGuid::Player>(guid));
+                if (!bot)
+                    continue;
+
+                // A bot already standing in this zone within the [Min,Max] working band of a real
+                // player is reused in place: there's no point spending a teleport (or a respec) to
+                // relocate one that's already where MaintainWorldPvpBots() would leave it anyway.
+                Player* nearestAnchor = nullptr;
+                float nearestDist = std::numeric_limits<float>::max();
+                for (Player* p : playersInZone)
+                {
+                    float d = bot->GetDistance(p);
+                    if (d < nearestDist)
+                    {
+                        nearestDist = d;
+                        nearestAnchor = p;
+                    }
+                }
+                bool alreadyPositioned = bot->GetZoneId() == zoneId && nearestAnchor &&
+                                         nearestDist <= sPlayerbotAIConfig.syncBotsWithPlayerMaxDistance;
+
+                // `anchor` is purely a positioning target (where to teleport the bot): the already-
+                // positioned player it's standing next to, or - for everyone else - a round-robin pick
+                // across the players sharing the zone instead of clustering all the recruits around
+                // whichever player happens to be first in the list. Leveling itself uses avgZoneLevel
+                // (the zone's real-player population as a whole), not anchor's own level.
+                Player* anchor = alreadyPositioned ? nearestAnchor : playersInZone[i % playersInZone.size()];
+                uint32 pLevel = avgZoneLevel;
+
+                // Attempt the move FIRST, using the bot's current (pre-relevel) level and gear. This
+                // way a bot that can't actually reach the player's zone (contested/faction-exclusive
+                // territory, unreachable terrain, or a real player nearby making the teleport visible)
+                // is left completely untouched instead of paying for an expensive respec that
+                // wouldn't have accomplished anything. It also means StarterLevelDistanceCheck (which
+                // only restricts bots that are ALREADY level <=16) is evaluated against the bot's real
+                // current level, not a not-yet-applied target level.
+                if (!alreadyPositioned && !TeleportWorldPvpBotNearTarget(bot, anchor))
+                    continue;
+                // else: the bot is already positioned near nearestAnchor - leave it standing where it is.
+
+                // Mirror RandomizeFirst()'s Death Knight floor: raise both bounds together so the
+                // clamp below can never see minLevel > levelCeiling.
+                int32 minLevel = 1;
+                int32 levelCeiling = static_cast<int32>(maxLevel);
+                if (bot->getClass() == CLASS_DEATH_KNIGHT)
+                {
+                    int32 dkFloor = static_cast<int32>(sWorld->getIntConfig(CONFIG_START_HEROIC_PLAYER_LEVEL));
+                    minLevel = std::max(minLevel, dkFloor);
+                    levelCeiling = std::max(levelCeiling, dkFloor);
+                }
+
+                int32 targetLevel = std::clamp<int32>(
+                    static_cast<int32>(pLevel) + irand(-static_cast<int32>(variance), static_cast<int32>(variance)),
+                    minLevel, levelCeiling);
+
+                // A reused in-place bot whose current level is already within the same variance band
+                // MaintainWorldPvpBots() enforces is zone-appropriate as-is: leave it un-respecced so
+                // we don't churn its spec/gear for no benefit (a fresh Randomize could well land it
+                // back inside the band anyway). Bots outside the band still get the full clamp/respec
+                // below.
+                if (alreadyPositioned && std::abs(static_cast<int32>(bot->GetLevel()) - static_cast<int32>(pLevel)) <=
+                                             static_cast<int32>(variance))
+                    targetLevel = static_cast<int32>(bot->GetLevel());
+
+                if (static_cast<uint32>(targetLevel) != bot->GetLevel())
+                {
+                    bool leveledUp = targetLevel > static_cast<int32>(bot->GetLevel());
+                    PlayerbotFactory factory(bot, static_cast<uint32>(targetLevel));
+                    // Down-leveling needs a full respec (clears spells/skills/items above the new level),
+                    // matching the project's own downgradeMaxLevelBot precedent in RandomizeFirst().
+                    factory.Randomize(leveledUp);
+                }
+
+                claimedThisTick.insert(guid);
+                --globalMoveBudget;
+
+                // Mark it as a world PvP bot: ProcessBot() will keep it from wandering off via its
+                // normal per-level teleport cycle until no valid real player remains in the zone
+                // (MaintainWorldPvpBots() releases it then).
+                worldPvpBots[guid] = WorldPvpBotEntry{ zoneId, static_cast<uint32>(targetLevel) };
+
+                if (sPlayerbotAIConfig.worldPvpDebug)
+                    LOG_INFO("playerbots", "[WorldPvpDebug] marked bot {} (guid {}) zone {} level {} for world pvp",
+                             bot->GetName(), guid, zoneId, static_cast<uint32>(targetLevel));
+
+                // Reset the bot's normal random-teleport cycle (same bounds ProcessBot() uses) so it
+                // isn't immediately yanked elsewhere again right after being synced to the player.
+                uint32 nextTeleport = urand(sPlayerbotAIConfig.minRandomBotTeleportInterval,
+                                            sPlayerbotAIConfig.maxRandomBotTeleportInterval);
+                ScheduleTeleport(guid, nextTeleport);
+
+                if (!globalMoveBudget)
+                    break;
+            }
+        }
+    }
+
+    // Periodic (once per sync interval, not per server tick) visibility into world PvP bot population,
+    // broken down by zone and faction.
+    std::map<uint32, std::pair<uint32, uint32>> countsByZone;  // zoneId -> [allianceCount, hordeCount]
+    for (auto const& [guid, entry] : worldPvpBots)
+    {
+        Player* bot = GetPlayerBot(ObjectGuid::Create<HighGuid::Player>(guid));
+        if (!bot || !bot->IsInWorld())
+            continue;
+
+        std::pair<uint32, uint32>& counts = countsByZone[entry.zoneId];
+        if (bot->GetTeamId() == TEAM_ALLIANCE)
+            counts.first++;
+        else
+            counts.second++;
+    }
+
+    for (auto const& [zoneId, counts] : countsByZone)
+    {
+        AreaTableEntry const* zone = sAreaTableStore.LookupEntry(zoneId);
+        std::string zoneName = zone ? zone->area_name[sWorld->GetDefaultDbcLocale()] : std::to_string(zoneId);
+
+        if (counts.first)
+            LOG_INFO("playerbots", "World pvp random bots - Alliance - {} - {}", zoneName, counts.first);
+
+        if (counts.second)
+            LOG_INFO("playerbots", "World pvp random bots - Horde - {} - {}", zoneName, counts.second);
+    }
+}
+
 void RandomPlayerbotMgr::ScheduleRandomize(uint32 bot, uint32 time) { SetEventValue(bot, "randomize", 1, time); }
 
 void RandomPlayerbotMgr::ScheduleTeleport(uint32 bot, uint32 time)
@@ -1549,11 +2028,21 @@ bool RandomPlayerbotMgr::ProcessBot(Player* bot)
         uint32 teleport = GetEventValue(botId, "teleport");
         if (!teleport)
         {
+            uint32 time = urand(sPlayerbotAIConfig.minRandomBotTeleportInterval,
+                                sPlayerbotAIConfig.maxRandomBotTeleportInterval);
+
+            // Marked world-PvP bots stay put until they reach a matching player and are killed, or are
+            // released by MaintainWorldPvpBots()'s reach-timeout - the normal per-level teleport cycle
+            // would otherwise yank them out of their assigned zone before they get used.
+            if (worldPvpBots.count(botId))
+            {
+                ScheduleTeleport(botId, time);
+                return true;
+            }
+
             LOG_DEBUG("playerbots", "Bot #{} <{}>: teleport for level and refresh", botId, bot->GetName());
             Refresh(bot);
             RandomTeleportForLevel(bot);
-            uint32 time = urand(sPlayerbotAIConfig.minRandomBotTeleportInterval,
-                                sPlayerbotAIConfig.maxRandomBotTeleportInterval);
             ScheduleTeleport(botId, time);
             return true;
         }
@@ -1574,36 +2063,37 @@ void RandomPlayerbotMgr::Revive(Player* player)
     RandomTeleportGrindForLevel(player);
 }
 
-void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation>& locs, bool hearth)
+bool RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation>& locs, bool hearth,
+                                        bool allowNearbyPlayers)
 {
     // ignore when alrdy teleported or not in the world yet.
     if (bot->IsBeingTeleported() || !bot->IsInWorld())
-        return;
+        return false;
 
     // no teleport / movement update when rooted.
     if (bot->IsRooted())
-        return;
+        return false;
 
     // ignore when in queue for battle grounds.
     if (bot->InBattlegroundQueue())
-        return;
+        return false;
 
     // ignore when in battle grounds or arena.
     if (bot->InBattleground() || bot->InArena())
-        return;
+        return false;
 
     // ignore when in group (e.g. world, dungeons, raids) and leader is not a player.
     if (bot->GetGroup() && !bot->GetGroup()->IsLeader(bot->GetGUID()))
-        return;
+        return false;
 
     PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
-    if (botAI)
-    {
-        // ignore when in when taxi with boat/zeppelin and has players nearby
-        if (bot->HasUnitMovementFlag(MOVEMENTFLAG_ONTRANSPORT) && bot->HasUnitState(UNIT_STATE_IGNORE_PATHFINDING) &&
-            botAI->HasPlayerNearby())
-            return;
-    }
+    if (!botAI)
+        return false;
+
+    // ignore when in when taxi with boat/zeppelin and has players nearby
+    if (bot->HasUnitMovementFlag(MOVEMENTFLAG_ONTRANSPORT) && bot->HasUnitState(UNIT_STATE_IGNORE_PATHFINDING) &&
+        botAI->HasPlayerNearby())
+        return false;
 
     // if (sPlayerbotAIConfig.randomBotRpgChance < 0)
     //     return;
@@ -1611,7 +2101,7 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation>&
     if (locs.empty())
     {
         LOG_DEBUG("playerbots", "Cannot teleport bot {} - no locations available", bot->GetName().c_str());
-        return;
+        return false;
     }
 
     std::vector<WorldPosition> tlocs;
@@ -1630,7 +2120,7 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation>&
     if (tlocs.empty())
     {
         LOG_DEBUG("playerbots", "Cannot teleport bot {} - all locations removed by filter", bot->GetName().c_str());
-        return;
+        return false;
     }
 
     PerfMonitorOperation* pmo = sPerfMonitor.start(PERF_MON_RNDBOT, "RandomTeleportByLocations");
@@ -1691,8 +2181,11 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation>&
             bot->SetHomebind(loc, zone->ID);
         }
 
-        // Prevent blink to be detected by visible real players
-        if (botAI->HasPlayerNearby(150.0f))
+        // Prevent blink to be detected by visible real players. The world-PvP recruit path opts out
+        // (allowNearbyPlayers): there we deliberately WANT bots to appear near the players in the zone,
+        // and this break is otherwise the single biggest cause of already-in-zone recruits silently
+        // failing to teleport.
+        if (!allowNearbyPlayers && botAI->HasPlayerNearby(150.0f))
         {
             break;
         }
@@ -1708,7 +2201,7 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation>&
         if (pmo)
             pmo->finish();
 
-        return;
+        return true;
     }
 
     if (pmo)
@@ -1716,6 +2209,7 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation>&
 
     // LOG_ERROR("playerbots", "Cannot teleport bot {} - no locations available ({} locations)", bot->GetName().c_str(),
     //           tlocs.size());
+    return false;
 }
 
 void RandomPlayerbotMgr::PrepareAddclassCache()
@@ -2123,6 +2617,27 @@ bool RandomPlayerbotMgr::IsRandomBot(ObjectGuid::LowType bot)
         return true;
 
     return false;
+}
+
+bool RandomPlayerbotMgr::IsWorldPvpBot(ObjectGuid::LowType bot)
+{
+    return worldPvpBots.count(bot) != 0;
+}
+
+uint32 RandomPlayerbotMgr::GetWorldPvpBotZoneId(ObjectGuid::LowType bot)
+{
+    auto it = worldPvpBots.find(bot);
+    return it != worldPvpBots.end() ? it->second.zoneId : 0;
+}
+
+bool RandomPlayerbotMgr::TeleportWorldPvpBotNearTarget(Player* bot, Player* target)
+{
+    std::vector<WorldLocation> locs = GetLocationsAroundPlayer(
+        target, 12, sPlayerbotAIConfig.syncBotsWithPlayerMinDistance,
+        sPlayerbotAIConfig.syncBotsWithPlayerMaxDistance);
+    // allowNearbyPlayers=true: world PvP explicitly WANTS bots to appear near the real
+    // players in the zone, so bypass RandomTeleport's anti-blink 150y break here.
+    return RandomTeleport(bot, locs, /*hearth=*/false, /*allowNearbyPlayers=*/true);
 }
 
 bool RandomPlayerbotMgr::IsAddclassBot(Player* bot)

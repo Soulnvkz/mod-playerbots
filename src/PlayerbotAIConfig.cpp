@@ -690,6 +690,18 @@ bool PlayerbotAIConfig::Initialize()
     syncLevelWithPlayers = sConfigMgr->GetOption<bool>("AiPlayerbot.SyncLevelWithPlayers", false);
     randomBotGroupNearby = sConfigMgr->GetOption<bool>("AiPlayerbot.RandomBotGroupNearby", false);
 
+    syncBotsWithPlayer = sConfigMgr->GetOption<bool>("AiPlayerbot.SyncBotsWithPlayer", false);
+    syncBotsWithPlayerZoneTargetCount =
+        sConfigMgr->GetOption<int32>("AiPlayerbot.SyncBotsWithPlayerZoneTargetCount", 40);
+    syncBotsWithPlayerLevelVariance = sConfigMgr->GetOption<int32>("AiPlayerbot.SyncBotsWithPlayerLevelVariance", 3);
+    syncBotsWithPlayerMaxPerInterval = sConfigMgr->GetOption<int32>("AiPlayerbot.SyncBotsWithPlayerMaxPerInterval", 5);
+    syncBotsWithPlayerInterval = sConfigMgr->GetOption<int32>("AiPlayerbot.SyncBotsWithPlayerInterval", 120);
+    syncBotsWithPlayerMinDistance = sConfigMgr->GetOption<float>("AiPlayerbot.SyncBotsWithPlayerMinDistance", 250.0f);
+    syncBotsWithPlayerMaxDistance = sConfigMgr->GetOption<float>("AiPlayerbot.SyncBotsWithPlayerMaxDistance", 400.0f);
+    syncBotsWithPlayerOverleveledEnemyChance =
+        sConfigMgr->GetOption<float>("AiPlayerbot.SyncBotsWithPlayerOverleveledEnemyChance", 2.0f);
+    worldPvpDebug = sConfigMgr->GetOption<bool>("AiPlayerbot.WorldPvp.Debug", false);
+
     // arena
     randomBotArenaTeam2v2Count = sConfigMgr->GetOption<int32>("AiPlayerbot.RandomBotArenaTeam2v2Count", 10);
     randomBotArenaTeam3v3Count = sConfigMgr->GetOption<int32>("AiPlayerbot.RandomBotArenaTeam3v3Count", 10);
