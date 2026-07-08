@@ -6,6 +6,8 @@
 #ifndef PLAYERBOTS_RANDOMPLAYERBOTMGR_H
 #define PLAYERBOTS_RANDOMPLAYERBOTMGR_H
 
+#include <limits>
+
 #include "NewRpgInfo.h"
 #include "ObjectGuid.h"
 #include "PlayerbotMgr.h"
@@ -63,6 +65,15 @@ struct BotEventCache
     std::unordered_map<std::string, CachedEvent> events;
 };
 
+// Tracks a randombot recruited by RandomPlayerbotMgr::CheckPlayerZonePopulation() for world PvP so it
+// can be reused across checks (instead of being replaced every interval) and kept in its assigned zone
+// until no valid real player remains there.
+struct WorldPvpBotEntry
+{
+    uint32 zoneId = 0;
+    uint32 centerLevel = 0;
+};
+
 // https://gist.github.com/bradley219/5373998
 
 class botPIDImpl;
@@ -103,6 +114,9 @@ public:
     static bool HandlePlayerbotConsoleCommand(ChatHandler* handler, char const* args);
     bool IsRandomBot(Player* bot);
     bool IsRandomBot(ObjectGuid::LowType bot);
+    bool IsWorldPvpBot(ObjectGuid::LowType bot);
+    uint32 GetWorldPvpBotZoneId(ObjectGuid::LowType bot);
+    bool TeleportWorldPvpBotNearTarget(Player* bot, Player* target);
     bool IsAddclassBot(Player* bot);
     bool IsAddclassBot(ObjectGuid::LowType bot);
     void Randomize(Player* bot);
@@ -152,6 +166,7 @@ public:
     void CheckBgQueue();
     void CheckLfgQueue();
     void CheckPlayers();
+    void CheckPlayerZonePopulation();
     void LogBattlegroundInfo();
 
     std::map<TeamId, std::map<BattlegroundTypeId, std::vector<uint32>>> getBattleMastersCache()
@@ -203,6 +218,7 @@ private:
         this->BgCheckTimer = 0;
         this->LfgCheckTimer = 0;
         this->PlayersCheckTimer = 0;
+        this->SyncBotsCheckTimer = 0;
     }
 
     ~RandomPlayerbotMgr() = default;
@@ -229,6 +245,7 @@ private:
     time_t BgCheckTimer;
     time_t LfgCheckTimer;
     time_t PlayersCheckTimer;
+    time_t SyncBotsCheckTimer;
     time_t RealPlayerLastTimeSeen = 0;
     time_t DelayLoginBotsTimer;
     time_t printStatsTimer;
@@ -236,8 +253,11 @@ private:
     bool ProcessBot(uint32 bot);
     void ScheduleRandomize(uint32 bot, uint32 time);
     void RandomTeleport(Player* bot);
-    void RandomTeleport(Player* bot, std::vector<WorldLocation>& locs, bool hearth = false);
+    bool RandomTeleport(Player* bot, std::vector<WorldLocation>& locs, bool hearth = false,
+                        bool allowNearbyPlayers = false);
+    std::vector<WorldLocation> GetLocationsAroundPlayer(Player* player, uint32 count, float minDist, float maxDist);
     uint32 GetZoneLevel(uint16 mapId, float teleX, float teleY, float teleZ);
+    void MaintainWorldPvpBots();
     typedef void (RandomPlayerbotMgr::*ConsoleCommandHandler)(Player*);
     std::vector<Player*> players;
     uint32 processTicks;
@@ -247,6 +267,7 @@ private:
     std::map<TeamId, std::map<BattlegroundTypeId, std::vector<uint32>>> BattleMastersCache;
     std::unordered_map<uint32, BotEventCache> eventCache;
     std::list<uint32> currentBots;
+    std::unordered_map<uint32, WorldPvpBotEntry> worldPvpBots;
     uint32 bgBotsCount;
     uint32 playersLevel;
 
