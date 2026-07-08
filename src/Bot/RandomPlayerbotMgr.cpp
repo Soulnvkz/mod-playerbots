@@ -1553,20 +1553,17 @@ void RandomPlayerbotMgr::CheckPlayerZonePopulation()
         bool hasZoneBracket = sTravelMgr.GetZoneLevelBracket(zoneId, zoneMinLevel, zoneMaxLevel);
         bool overleveledForZone = hasZoneBracket && (avgPlayerLevel > zoneMaxLevel + 5);
 
-        uint32 allianceRatio = sPlayerbotAIConfig.randomBotAllianceRatio;
-        uint32 hordeRatio = sPlayerbotAIConfig.randomBotHordeRatio;
-        uint32 totalRatio = allianceRatio + hordeRatio;
-        if (!totalRatio)
-            continue;
+        float allianceRatio = sPlayerbotAIConfig.syncBotsWithPlayerAllianceRatio;
 
-        // Split the zone target across factions the same way AddRandomBots() splits the global bot
-        // count: give the remainder to one faction at random instead of letting integer division
-        // silently undershoot the configured target every single time. Computed once per zone (not
+        // Split the zone target across factions using a fractional Alliance share (0 = all Horde,
+        // 1 = all Alliance). Round probabilistically instead of truncating so the long-run average
+        // matches the configured ratio instead of always rounding down. Computed once per zone (not
         // per player), so the target is a shared budget for everyone in it.
         uint32 zoneTarget = sPlayerbotAIConfig.syncBotsWithPlayerZoneTargetCount;
-        uint32 allianceTarget = zoneTarget * allianceRatio / totalRatio;
-        uint32 remainder = zoneTarget * allianceRatio % totalRatio;
-        if (remainder && urand(1, totalRatio) <= remainder)
+        float allianceTargetExact = zoneTarget * allianceRatio;
+        uint32 allianceTarget = static_cast<uint32>(allianceTargetExact);
+        float remainder = allianceTargetExact - allianceTarget;
+        if (remainder > 0.0f && frand(0.0f, 1.0f) < remainder)
             allianceTarget++;
         uint32 hordeTarget = zoneTarget - allianceTarget;
 

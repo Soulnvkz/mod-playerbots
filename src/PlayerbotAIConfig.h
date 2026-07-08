@@ -382,6 +382,7 @@ public:
     float syncBotsWithPlayerMinDistance;
     float syncBotsWithPlayerMaxDistance;
     float syncBotsWithPlayerOverleveledEnemyChance;
+    float syncBotsWithPlayerAllianceRatio;
     bool worldPvpDebug;  // AiPlayerbot.WorldPvp.Debug - verbose World PvP logging
     bool autoLearnQuestSpells;
     bool autoTeleportForLevel;

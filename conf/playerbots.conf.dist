@@ -1270,11 +1270,18 @@ AiPlayerbot.AutoTeleportForLevel = 1
 AiPlayerbot.SyncBotsWithPlayer = 0
 
 # Combined Alliance+Horde randombot population target PER ZONE, split across factions using
-# AiPlayerbot.RandomBotAllianceRatio / RandomBotHordeRatio. This is a shared budget for the zone,
+# AiPlayerbot.SyncBotsWithPlayerAllianceRatio below. This is a shared budget for the zone,
 # not per player - if multiple real players are in the same zone, the total stays capped at this
 # value; players in different zones each get their own independent target.
 # Default: 40
 AiPlayerbot.SyncBotsWithPlayerZoneTargetCount = 40
+
+# Alliance share of the per-zone world PvP population target above, as a fraction from 0 to 1.
+# 0 = 100% Horde, 1 = 100% Alliance, 0.5 = an even 50/50 split. Independent of
+# AiPlayerbot.RandomBotAllianceRatio / RandomBotHordeRatio, which control the overall randombot
+# population instead.
+# Default: 0.5
+AiPlayerbot.SyncBotsWithPlayerAllianceRatio = 0.5
 
 # Synced bots are leveled to (player level +/- this variance)
 # Default: 3

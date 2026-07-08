@@ -700,6 +700,8 @@ bool PlayerbotAIConfig::Initialize()
     syncBotsWithPlayerMaxDistance = sConfigMgr->GetOption<float>("AiPlayerbot.SyncBotsWithPlayerMaxDistance", 400.0f);
     syncBotsWithPlayerOverleveledEnemyChance =
         sConfigMgr->GetOption<float>("AiPlayerbot.SyncBotsWithPlayerOverleveledEnemyChance", 2.0f);
+    syncBotsWithPlayerAllianceRatio =
+        sConfigMgr->GetOption<float>("AiPlayerbot.SyncBotsWithPlayerAllianceRatio", 0.5f);
     worldPvpDebug = sConfigMgr->GetOption<bool>("AiPlayerbot.WorldPvp.Debug", false);
 
     // arena
